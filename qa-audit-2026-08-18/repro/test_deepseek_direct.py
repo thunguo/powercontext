@@ -1,0 +1,51 @@
+import asyncio
+import os
+import time
+
+# Set DEEPSEEK_API_KEY in the environment before running this script, e.g.:
+#   export DEEPSEEK_API_KEY=sk-...
+if not os.environ.get("DEEPSEEK_API_KEY"):
+    raise SystemExit("Set the DEEPSEEK_API_KEY environment variable before running this script.")
+
+from pydantic_ai.models import infer_model
+
+from powercontext.builtin.artifacts.memory import (
+    MemoryExtractionInput,
+    MemoryExtractionOutput,
+    memory_extraction_instructions,
+)
+from powercontext.builtin.artifacts.memory.extraction import MemoryExtractionEvidence
+from powercontext.builtin.artifacts.memory.prompts import MemoryExtractionProfile
+from powercontext.builtin.inference.pydantic_ai import InferenceLimits, PydanticAIStructuredGenerator
+
+
+async def main():
+    model = infer_model("deepseek:deepseek-v4-flash")
+    generator = PydanticAIStructuredGenerator(
+        model=model,
+        instructions=memory_extraction_instructions(MemoryExtractionProfile.CODING),
+        input_type=MemoryExtractionInput,
+        output_type=MemoryExtractionOutput,
+        limits=InferenceLimits(timeout_seconds=30.0, max_requests=2),
+        name="memory_extraction",
+    )
+    payload = MemoryExtractionInput(
+        evidence=(
+            MemoryExtractionEvidence(
+                evidence_id="ev-1",
+                evidence_type="source",
+                content="The user prefers dark mode and Python 3.12. We decided to use PostgreSQL for the new service.",
+            ),
+        ),
+        current_entries=(),
+    )
+    t0 = time.monotonic()
+    try:
+        result = await generator.generate(payload)
+        print("SUCCESS", time.monotonic() - t0)
+        print(result.output)
+        print("usage:", result.usage)
+    except Exception as e:
+        print("ERROR after", time.monotonic() - t0, ":", type(e), e)
+
+asyncio.run(main())
