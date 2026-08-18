@@ -75,6 +75,7 @@ nav = [
         ] },
         { "开发" = [
             { "Core Protocol" = "zh/development/core-protocol.md" },
+            { "Issue Audit" = "zh/development/issue-audit.md" },
             { "Memory Layer" = "zh/development/memory-layer.md" },
             { "Pydantic AI 推理" = "zh/development/pydantic-ai-inference.md" },
             { "远程访问实现" = "zh/development/remote-access-implementation.md" },
