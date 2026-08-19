@@ -66,3 +66,24 @@ Pull requests should link the relevant issue or RFC, explain the rationale, summ
 ## Security & Configuration Tips
 
 Do not commit secrets, local virtual environments, caches, `.powercontext/`, `dist/`, or `site/`. Keep dependency changes reflected in `uv.lock`, and use `make check` to catch lock drift before review.
+
+## Cursor Cloud specific instructions
+
+The startup update script installs `uv` (to `~/.local/bin`, already on `PATH` in login shells) and runs `uv sync`, which
+builds `.venv` from `uv.lock`. Do not run `make install` in cloud sessions: it also installs `prek` git hooks, which are
+unnecessary here. Standard commands live in the `Makefile` and `CONTRIBUTING.md`; prefer them over ad-hoc invocations:
+
+- Lint + type check: `make check` (also verifies `uv.lock`, and runs the `prek` hooks, which fetch hook repos from the
+  network on their first run).
+- Tests: `make test` (pytest + doctests). Use `make unit-test` to skip `tests/e2e`.
+- Build wheel: `make build`; serve docs: `make docs`.
+
+Run the Server with `uv run powercontext server run` (foreground, binds `127.0.0.1:8000`, `Ctrl-C` for a clean
+shutdown). It creates a persistent SQLite database in the OS user data directory unless `POWERCONTEXT_HOME` or
+`POWERCONTEXT_SERVER_DATABASE_URL` is set (see `.env.example`).
+
+Non-obvious: inference-backed features (Memory extraction, Experience/Skill generation) are disabled unless an
+inference provider is configured (`OPENROUTER_API_KEY` plus the `POWERCONTEXT_SERVER_INFERENCE_*` settings in
+`.env.example`). Explicit Memory operations still work without any provider: `POST /v1/memory/remember` then
+`POST /v1/memory/search` with `"mode":"fts"` (full-text) is a good no-credentials end-to-end smoke test, and the test
+suite does not require external API keys.
