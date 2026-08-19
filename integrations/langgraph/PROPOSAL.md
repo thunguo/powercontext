@@ -21,7 +21,7 @@
 
 ### 问题
 
-[#1213](https://github.com/oceanbase/powercontext/issues/1213) 把 LangGraph 列为待办的 Framework 集成,给出与 Pydantic AI 提案相同的四条硬约束(复用现有接口、不复刻 Runtime/Memory、不依赖不受支持的扩展机制、安装器改动前需报告)。LangGraph 也是一个库,不是带 Hook 系统的终端宿主,因此"安装器需报告文件/权限/回滚"这条约束同样不适用。
+[#1213](https://github.com/oceanbase/powercontext/issues/1213) 把 LangGraph 列为待办的 Framework 集成,给出四条硬约束:复用现有接口、不复刻 Runtime/Memory 行为、不依赖不受支持的上游扩展机制、安装器改动用户环境前需报告文件/权限/回滚。LangGraph 是一个库,开发者在自己的代码里构建 `StateGraph` 并决定何时 `invoke()`,没有一个可以安装"插件"的宿主目录,因此"安装器需报告文件/权限/回滚"这条约束不适用(详见下文约束对照)。
 
 LangGraph 生态在 2026 年有一个必须先说清楚的现状变化,否则设计会建立在过时的事实上:`langgraph.prebuilt.create_react_agent` 已经标注为 deprecated,源码里的装饰器和运行期警告都明确指向新的入口:
 
@@ -37,7 +37,7 @@ def create_react_agent(...): ...
 
 原来常见的"传 `tools=` + `pre_model_hook=` 给 `create_react_agent`"这条捷径正在被 `langchain.agents.create_agent` 的 middleware 体系取代,而后者属于 `langchain` 包而不是 `langgraph` 包。既然 #1213 的 Frameworks 一栏写的是"LangGraph"而不是"LangChain",本提案把落点放在 LangGraph 自身、不会被这次迁移影响的核心原语上:`StateGraph`、节点(node)、`ToolNode`、`BaseCheckpointSaver`、`BaseStore`。
 
-同时,与 Pydantic AI 提案共享同一个前提事实:`prepare_context` **不在 MCP 工具面里**(`src/powercontext/server/mcp.py::_MCP_OPERATION_IDS` 没有它,`docs/en/docs/reference/interfaces.md` 也明确写了"intentionally does not project the operation as an MCP tool"),因此自动召回必须由适配包在图里主动调用,不能依赖模型自己选择去调用某个工具。此外,对 `libs/langgraph`、`libs/prebuilt`、`libs/checkpoint` 全文搜索 `MCP` 均无匹配——**LangGraph 核心本身不内置 MCP 客户端**,把 MCP Server 的工具接进 LangChain/LangGraph 工具列表,官方途径是单独安装 `langchain-ai` 维护的独立包 `langchain-mcp-adapters`。
+同时,`prepare_context` **不在 MCP 工具面里**(`src/powercontext/server/mcp.py::_MCP_OPERATION_IDS` 没有它,`docs/en/docs/reference/interfaces.md` 也明确写了"intentionally does not project the operation as an MCP tool"),因此自动召回必须由适配包在图里主动调用,不能依赖模型自己选择去调用某个工具。此外,对 `libs/langgraph`、`libs/prebuilt`、`libs/checkpoint` 全文搜索 `MCP` 均无匹配——**LangGraph 核心本身不内置 MCP 客户端**,把 MCP Server 的工具接进 LangChain/LangGraph 工具列表,官方途径是单独安装 `langchain-ai` 维护的独立包 `langchain-mcp-adapters`。
 
 ### 提议的解决方案
 
@@ -52,7 +52,7 @@ integrations/langgraph/
     ├── settings.py                 # PowerContextSettings(pydantic-settings,POWERCONTEXT_LANGGRAPH_ 前缀)
     ├── recall.py                   # build_recall_node(...) -> 可 add_node 的召回节点
     ├── tools.py                    # build_tools(...) -> list[BaseTool]:search/remember/context
-    └── scope.py                    # 项目 scope 派生,与 pydantic-ai 适配包共享同一份实现思路
+    └── scope.py                    # 项目 scope 派生(见下文,复用而非重写)
 ```
 
 ```toml
@@ -77,9 +77,9 @@ mcp = ["langchain-mcp-adapters>=0.1"]
 uv add "powercontext[client]" powercontext-langgraph
 ```
 
-鉴权、明文 HTTP 仅限回环地址的校验规则,与 Pydantic AI 适配包保持一致。
+鉴权直接透传 `PowerContextClient(base_url, token=...)` 已有的 Bearer token 支持(`client.py:156-165`),token 通过环境变量 `POWERCONTEXT_LANGGRAPH_AUTHORIZATION` 或显式构造参数传入,不落盘、不写入 trace。回环地址(`127.0.0.1`/`localhost`/`::1`)允许明文 HTTP,其余地址要求 HTTPS,与 Claude Code 插件的 URL 校验逻辑保持一致。
 
-**Scope 映射**:与 Pydantic AI 适配包共享同一套三层优先级(显式 `scope_id` > 项目目录的 Git 远程归一化 > 报错而非静默兜底)。LangGraph 场景下,`scope_id` 建议放在 `RunnableConfig["configurable"]` 里(与 LangGraph 自己的 `thread_id` 并列),而不是烘焙进节点闭包,这样同一个编译好的图可以在多租户场景下按请求区分 scope:
+**Scope 映射**:Codex 与 Claude Code 插件已有一套稳定的派生规则(`integrations/codex/plugins/powercontext/scripts/project_scope.py::derive_scope_id`):显式覆盖 > Git 远程地址归一化 > 项目目录哈希。LangGraph 是库而非"以某个工作目录启动的宿主进程",没有天然的 `cwd`,因此提供等价但输入方式不同的三层优先级:显式 `scope_id` > 项目目录的 Git 远程归一化(复用 `derive_scope_id` 里已验证过的算法)> 报错而非静默生成随机 scope。`scope_id` 建议放在 `RunnableConfig["configurable"]` 里(与 LangGraph 自己的 `thread_id` 并列),而不是烘焙进节点闭包,这样同一个编译好的图可以在多租户场景下按请求区分 scope:
 
 ```python
 result = await graph.ainvoke(
@@ -200,7 +200,17 @@ def build_tools(*, base_url: str, timeout: float = 10.0) -> list:
 
 **任务级轨迹捕获(可选,默认关闭)**:`graph.ainvoke(...)` 返回的最终 state 里,`messages` 已经包含了这一轮的完整历史(拜 `add_messages` reducer 所赐),调用方直接切片本轮新增的消息,序列化后调用 `capture_content_source` 即可,不需要额外的"捕获节点"。
 
-**失败与恢复行为**,与 Pydantic AI 提案完全对齐:`prepare_context` 失败或超时 → 召回节点返回空更新,不注入,不抛出;工具调用失败 → 以字符串错误返回给模型,不中断图执行;Server 不可达 → 图照常运行,只是没有记忆增强。不引入自定义重试/熔断,`PowerContextClient` 本身没有重试语义,适配包不加。
+**失败与恢复行为**,沿用 Codex/Claude Code/Bub 已验证过的 fail-open 契约:
+
+| 情形 | 行为 |
+| --- | --- |
+| `prepare_context` 抛出 `TransportError` / `ServerResponseError` / `InvalidResponseError` | 召回节点返回空更新(`{}`),不注入,不抛出 |
+| `PreparedContext.status == "empty"` | 不注入,视为正常情形而非错误 |
+| 显式工具(`search`/`remember`)调用失败 | 以字符串形式把可读错误返回给模型,不中断图执行 |
+| 轨迹捕获失败 | 记录日志,不影响已经产出的最终 state |
+| PowerContext Server 完全不可达 | 图照常运行,只是没有记忆增强,等价于未接入 PowerContext |
+
+不引入自定义重试/熔断策略——`PowerContextClient` 本身没有重试语义,适配包也不加,重试策略留给使用方在自己的部署里通过 httpx 传输层配置。
 
 **与 #1213 约束的对照**:
 
@@ -240,7 +250,7 @@ mcp_tools = await client.get_tools()  # 包含 search_memory / remember_memory /
 
 ## Additional context
 
-**测试计划**:与 Pydantic AI 提案共享同一套 Server 侧测试基础设施:`create_server_app` + `httpx.ASGITransport` 起一个内存态 PowerContext Server,无真实网络。模型侧用一个固定输出的 fake chat model(`langgraph` 自身测试套件里已经在用类似的 `FakeToolCallingModel` 模式,见 `libs/prebuilt/tests/test_react_agent.py`),覆盖:
+**测试计划**:参照 `tests/e2e/test_dsh_http_chain.py` 的模式,用 `create_server_app` + `httpx.ASGITransport` 起一个内存态 PowerContext Server,无真实网络、无需 API Key。模型侧用一个固定输出的 fake chat model(`langgraph` 自身测试套件里已经在用类似的 `FakeToolCallingModel` 模式,见 `libs/prebuilt/tests/test_react_agent.py`),覆盖:
 
 1. 召回节点在有 Prepared Context 时正确追加 `SystemMessage`,同一次 `ainvoke` 调用内不重复调用 Server;
 2. `powercontext_search`/`powercontext_remember`/`powercontext_context` 工具经 `ToolNode` 调用后返回预期内容;
