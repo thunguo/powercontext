@@ -26,6 +26,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.artifacts.experience import EXPERIENCE_INCUBATION_CURSOR_NAME
@@ -33,11 +34,12 @@ from powercontext.builtin.artifacts.profile.models import (
     PROFILE_SOURCE_WINDOW_BINDING,
     ProfileFlushResult,
 )
-from powercontext.builtin.artifacts.profile.service import RelationalProfileService
+from powercontext.builtin.artifacts.profile.service import PreparedProfileFlush, RelationalProfileService
 from powercontext.builtin.artifacts.prompt.service import current_prompt
 from powercontext.builtin.inference.usage import bind_usage_reporter
 from powercontext.builtin.persistence.cursors import StoredSourceCursor
-from powercontext.builtin.persistence.database import database_now
+from powercontext.builtin.persistence.database import database_now, is_transaction_contention
+from powercontext.builtin.persistence.errors import GenerationConflictError
 from powercontext.builtin.persistence.rate_limit import RateLimitRepository
 from powercontext.builtin.persistence.tables import PROFILE_POLICIES_TABLE
 from powercontext.builtin.persistence.work import (
@@ -47,6 +49,7 @@ from powercontext.builtin.persistence.work import (
     WorkResult,
     WorkSpec,
 )
+from powercontext.builtin.records import BaseValueConflictError
 from powercontext.builtin.runtime.cron import CronSchedule
 from powercontext.builtin.runtime.durable_scheduler import DiscoveryPage
 from powercontext.builtin.runtime.models import ExperienceIncubationResult, MemoryFlushResult
@@ -56,16 +59,15 @@ from powercontext.builtin.runtime.worker import PreparedWork, WorkExecutionError
 from powercontext.builtin.sources import SourceCursor, validate_scope_id
 from powercontext.builtin.statistics import ModelUsagePurpose
 from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME, SourceHighWatermark, SourceWindowTrigger
-from powercontext.errors import ArtifactNotFoundError
+from powercontext.errors import ArtifactNotFoundError, RevisionConflictError
 
 MEMORY_WORK_KIND = "powercontext.memory.source-window"
 EXPERIENCE_WORK_KIND = "powercontext.experience.incubation"
 PROFILE_WORK_KIND = "powercontext.profile.source-window"
 MAINTENANCE_WORK_KIND = "powercontext.maintenance.operations"
 CURRENT_WORK_PAYLOAD_VERSION = 1
-_PROFILE_WINDOW_LIMIT = 100
 
-ProfileWorkRunner = Callable[[str, int, RelationalProfileService], Awaitable[ProfileFlushResult]]
+ProfileWorkRunner = Callable[[str, int, RelationalProfileService], Awaitable[PreparedProfileFlush]]
 
 
 class WorkRequester(BaseModel):
@@ -295,6 +297,20 @@ class MemoryWorkHandler:
                         code="already_committed",
                     )
                 )
+            if _is_superseded_window(payload, current_sequence, current_generation):
+                # A committed racing window consumed this snapshot's prefix.
+                # Retire instead of failing so the key is released and the lane
+                # keeps moving; discovery re-enqueues the remaining Sources.
+                return PreparedWork(
+                    result=_memory_result(
+                        previous=payload.after,
+                        current=current_sequence,
+                        high_watermark=payload.high_watermark,
+                        source_count=0,
+                        memory_ref=None,
+                        code="superseded",
+                    )
+                )
             _require_exact_cursor(payload, current_sequence, current_generation)
             rows = await services.repositories.sources.list_window(
                 connection,
@@ -411,6 +427,19 @@ class ExperienceWorkHandler:
                         code="already_committed",
                     )
                 )
+            if _is_superseded_window(payload, current_sequence, current_generation):
+                # Same retirement rule as Memory: a committed racing window
+                # consumed the prefix, so release the key and let discovery
+                # re-enqueue the remainder instead of failing the lane.
+                return PreparedWork(
+                    result=_experience_result(
+                        payload,
+                        source_count=0,
+                        candidate_count=0,
+                        code="superseded",
+                        current_cursor=current_sequence,
+                    )
+                )
             _require_exact_cursor(payload, current_sequence, current_generation)
             rows = await services.repositories.sources.list_window(
                 connection,
@@ -493,7 +522,14 @@ class ExperienceWorkHandler:
 
 
 class ProfileWorkHandler:
-    """Run bounded Profile catch-up through the fenced Profile cursor CAS."""
+    """Prepare one Profile window outside locks and commit it with Work success.
+
+    One attempt prepares and commits exactly one window: the model call runs
+    outside any transaction during ``prepare``, and the Profile, its cursor
+    and the Work success commit inside the single fenced completion
+    transaction. Remaining windows are re-discovered on the next scheduled
+    scan, so an expired or superseded Worker can never publish a Profile.
+    """
 
     kind = PROFILE_WORK_KIND
     supported_versions = frozenset({CURRENT_WORK_PAYLOAD_VERSION})
@@ -512,34 +548,30 @@ class ProfileWorkHandler:
     async def prepare(self, claim: WorkClaim, /) -> PreparedWork:
         payload = _profile_payload(claim)
         async with self._semaphore:
-            result = await self._catch_up(claim.scope_id, payload)
-        return PreparedWork(
-            result=WorkResult(code=result.status, payload=result.model_dump(mode="json", exclude_none=True))
-        )
-
-    async def _catch_up(self, scope_id: str, payload: ProfileWorkPayload) -> ProfileFlushResult:
-        result = ProfileFlushResult(
-            status="noop",
-            previous_cursor=payload.after,
-            current_cursor=payload.after,
-            high_watermark=payload.high_watermark,
-        )
-        for _ in range(_PROFILE_WINDOW_LIMIT):
-            previous = result.current_cursor
-            result = (
-                await self._profiles.flush(scope_id, high_watermark=payload.high_watermark)
-                if self._runner is None
-                else await self._runner(scope_id, payload.high_watermark, self._profiles)
+            prepared = (
+                await self._runner(claim.scope_id, payload.high_watermark, self._profiles)
+                if self._runner is not None
+                else await self._profiles.prepare_flush(claim.scope_id, high_watermark=payload.high_watermark)
             )
-            if result.status == "conflict":
-                raise WorkExecutionError(category="conflict", code="profile_cursor_changed", retryable=True)
-            if (
-                result.status in {"disabled", "review_pending"}
-                or result.current_cursor >= payload.high_watermark
-                or result.current_cursor <= previous
-            ):
-                return result
-        return result
+        if prepared.result is not None:
+            return PreparedWork(result=_profile_result(prepared.result))
+
+        async def commit(connection: AsyncConnection) -> WorkResult:
+            try:
+                flushed = await self._profiles.commit_flush(connection, prepared)
+            except (
+                BaseValueConflictError,
+                GenerationConflictError,
+                RevisionConflictError,
+                IntegrityError,
+                OperationalError,
+            ) as error:
+                if isinstance(error, OperationalError) and not is_transaction_contention(error):
+                    raise
+                raise WorkExecutionError(category="conflict", code="profile_cursor_changed", retryable=True) from error
+            return _profile_result(flushed)
+
+        return PreparedWork(result=None, commit=commit)
 
 
 class OperationMaintenanceHandler:
@@ -817,6 +849,21 @@ def _require_exact_cursor(payload: SourceWindowPayload, sequence: int, generatio
         raise WorkExecutionError(category="conflict", code="cursor_changed", retryable=False)
 
 
+def _is_superseded_window(payload: SourceWindowPayload, sequence: int, generation: int) -> bool:
+    """True when a committed racing window already consumed this snapshot's prefix.
+
+    A generation mismatch means the Source cursor was regenerated and the
+    window identity no longer holds, which stays a terminal failure — except
+    for snapshots taken before the cursor row existed at all: the racing
+    window's first commit creates that row at generation 1, which is an
+    ordinary advance, not a reset.
+    """
+
+    if payload.cursor_generation == 0:
+        return generation == 1 and payload.after < sequence < payload.through
+    return generation == payload.cursor_generation and payload.after < sequence < payload.through
+
+
 def _require_complete_window(rows, payload: SourceWindowPayload) -> None:
     expected = payload.through - payload.after
     if len(rows) != expected or any(
@@ -851,16 +898,21 @@ def _experience_result(
     candidate_count: int,
     candidate_ids: tuple[str, ...] = (),
     code: str,
+    current_cursor: int | None = None,
 ) -> WorkResult:
     result = ExperienceIncubationResult(
         previous_cursor=payload.after,
-        current_cursor=payload.through,
+        current_cursor=payload.through if current_cursor is None else current_cursor,
         high_watermark=payload.high_watermark,
         source_count=source_count,
         candidate_count=candidate_count,
         candidate_ids=candidate_ids,
     )
     return WorkResult(code=code, payload=result.model_dump(mode="json"))
+
+
+def _profile_result(result: ProfileFlushResult) -> WorkResult:
+    return WorkResult(code=result.status, payload=result.model_dump(mode="json", exclude_none=True))
 
 
 def _digest(value: str) -> str:
